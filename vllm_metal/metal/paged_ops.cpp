@@ -9,6 +9,7 @@
 // RTTI matching which fails due to hidden symbol visibility in libmlx.
 
 #include <algorithm>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -1209,14 +1210,20 @@ static void dispatch_mla_paged_attention(
   const int max_num_partitions =
       (max_seq_len + kPartitionSize - 1) / kPartitionSize;
   const int gate_grid = (num_heads / heads_per_tg) * total_q_tokens;
-  // MLA split-KV writes a 512-wide tmp_out per partition before the reduce.
-  // Keep the first gate narrower than MHA's generic min_decode_grid() gate:
-  // local sweeps show the extra scratch/reduce traffic stops paying off once
-  // the unsplit MLA grid is already a few dozen threadgroups.
-  const int mla_split_grid_limit = std::min(min_decode_grid(), 32);
+  const bool occupancy_limited = gate_grid < min_decode_grid();
+  // MLA split-KV has the same occupancy motivation as MHA split-KV, but it
+  // writes a kv_lora_rank-wide partial output for every partition before the
+  // reduce. Bound that scratch/reduce traffic explicitly instead of narrowing
+  // the occupancy gate indirectly.
+  constexpr int64_t kMlaSplitScratchValueLimit = 256 * 1024;
+  const int64_t split_scratch_values =
+      static_cast<int64_t>(total_q_tokens) * num_heads *
+      max_num_partitions * kv_lora_rank;
+  const bool scratch_budget_ok =
+      split_scratch_values <= kMlaSplitScratchValueLimit;
   const bool partition =
-      pure_decode && gate_grid <= mla_split_grid_limit
-      && max_num_partitions >= 2;
+      pure_decode && occupancy_limited && max_num_partitions >= 2
+      && scratch_budget_ok;
 
   std::string kname = "paged_mla_attention_" + dt + "_kvr" +
                       std::to_string(kv_lora_rank) + "_pe" +
