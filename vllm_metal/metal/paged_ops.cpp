@@ -1148,6 +1148,13 @@ static int mla_num_threads_for_g(int heads_per_tg) {
   }
 }
 
+static int mla_partition_size_for_context(int max_seq_len) {
+  if (max_seq_len >= 131072) return 65536;
+  if (max_seq_len >= 65536) return 32768;
+  if (max_seq_len >= 32768) return 16384;
+  return 0;
+}
+
 static void dispatch_mla_paged_attention(
     array& out,
     const array& q_nope,
@@ -1207,23 +1214,29 @@ static void dispatch_mla_paged_attention(
   auto dt = dtype_to_metal(q_nope.dtype());
   const bool pure_decode = total_q_tokens == num_seqs;
   const int max_seq_len = max_num_blocks_per_seq * block_size;
+  const int mla_partition_size = mla_partition_size_for_context(max_seq_len);
   const int max_num_partitions =
-      (max_seq_len + kPartitionSize - 1) / kPartitionSize;
+      mla_partition_size > 0
+          ? (max_seq_len + mla_partition_size - 1) / mla_partition_size
+          : 1;
   const int gate_grid = (num_heads / heads_per_tg) * total_q_tokens;
-  const bool occupancy_limited = gate_grid < min_decode_grid();
-  // MLA split-KV has the same occupancy motivation as MHA split-KV, but it
-  // writes a kv_lora_rank-wide partial output for every partition before the
-  // reduce. Bound that scratch/reduce traffic explicitly instead of narrowing
-  // the occupancy gate indirectly.
-  constexpr int64_t kMlaSplitScratchValueLimit = 256 * 1024;
+  constexpr int kMlaMaxSinglePassGrid = 32;
+  const bool occupancy_limited = gate_grid < kMlaMaxSinglePassGrid;
+  // MLA split-KV manufactures more in-flight memory work by splitting the
+  // long-context scan across grid.z. Keep the partition count small: each
+  // partition writes a vLLM-style scratch row with kv_lora_rank partial output
+  // values plus one LSE, and the reduce reads it back.
+  constexpr int kMlaMaxNumPartitions = 4;
+  constexpr int64_t kMlaSplitScratchValueLimit = 512 * 1024;
   const int64_t split_scratch_values =
       static_cast<int64_t>(total_q_tokens) * num_heads *
-      max_num_partitions * kv_lora_rank;
+      max_num_partitions * (kv_lora_rank + 1);
   const bool scratch_budget_ok =
       split_scratch_values <= kMlaSplitScratchValueLimit;
   const bool partition =
-      pure_decode && occupancy_limited && max_num_partitions >= 2
-      && scratch_budget_ok;
+      pure_decode && occupancy_limited && mla_partition_size > 0
+      && max_num_partitions >= 2
+      && max_num_partitions <= kMlaMaxNumPartitions && scratch_budget_ok;
 
   std::string kname = "paged_mla_attention_" + dt + "_kvr" +
                       std::to_string(kv_lora_rank) + "_pe" +
@@ -1231,7 +1244,7 @@ static void dispatch_mla_paged_attention(
                       std::to_string(block_size) + "_g" +
                       std::to_string(heads_per_tg) + "_nt" +
                       std::to_string(num_threads) + "_nsl32_ps" +
-                      std::to_string(partition ? kPartitionSize : 0);
+                      std::to_string(partition ? mla_partition_size : 0);
 
   bool use_partitioning = partition;
 
@@ -1291,22 +1304,17 @@ static void dispatch_mla_paged_attention(
     enc.add_temporary(a);
     return a;
   };
-  array tmp_out = make_temp(
-      Shape{total_q_tokens, num_heads, max_num_partitions, kv_lora_rank},
-      q_nope.dtype());
-  array exp_sums =
-      make_temp(Shape{total_q_tokens, num_heads, max_num_partitions}, float32);
-  array max_logits =
-      make_temp(Shape{total_q_tokens, num_heads, max_num_partitions}, float32);
+  array attn_logits = make_temp(
+      Shape{total_q_tokens, num_heads, max_num_partitions, kv_lora_rank + 1},
+      float32);
 
-  // Pass 1: split the context into kPartitionSize-token chunks. The main MLA
-  // kernel writes a normalized partial output plus softmax stats per partition.
+  // Pass 1: split the context into mla_partition_size-token chunks. The main MLA
+  // kernel writes normalized partial output plus LSE per partition.
   enc.set_compute_pipeline_state(kernel);
   enc.set_threadgroup_memory_length(shmem, 0);
 
-  enc.set_output_array(exp_sums, 0);
-  enc.set_output_array(max_logits, 1);
-  enc.set_output_array(tmp_out, 2);
+  enc.set_output_array(attn_logits, 0);
+  enc.set_output_array(out, 2);
   enc.set_input_array(q_nope, 3);
   enc.set_input_array(q_pe, 4);
   enc.set_input_array(latent_cache, 5);
@@ -1332,17 +1340,15 @@ static void dispatch_mla_paged_attention(
   constexpr int REDUCE_NUM_WARPS = REDUCE_NUM_THREADS / 32;
   std::string reduce_kname = "paged_mla_attention_reduce_" + dt + "_hs" +
                              std::to_string(kv_lora_rank) + "_nt256_nsl32_ps" +
-                             std::to_string(kPartitionSize);
+                             std::to_string(mla_partition_size);
   auto* reduce_kernel = d.get_kernel(reduce_kname, lib, reduce_kname, {});
 
   size_t reduce_shmem = static_cast<size_t>(
-      (2 * max_num_partitions + 2 * REDUCE_NUM_WARPS) * sizeof(float));
+      (max_num_partitions + 2 * REDUCE_NUM_WARPS) * sizeof(float));
   enc.set_compute_pipeline_state(reduce_kernel);
   enc.set_threadgroup_memory_length((reduce_shmem + 15) & ~size_t(15), 0);
   enc.set_output_array(out, 0);
-  enc.set_input_array(exp_sums, 1);
-  enc.set_input_array(max_logits, 2);
-  enc.set_input_array(tmp_out, 3);
+  enc.set_input_array(attn_logits, 1);
   enc.set_input_array(context_lens, 4);
   int32_t max_num_partitions_i = static_cast<int32_t>(max_num_partitions);
   enc.set_bytes(max_num_partitions_i, 5);
@@ -1350,8 +1356,8 @@ static void dispatch_mla_paged_attention(
       MTL::Size::Make(num_heads, total_q_tokens, 1),
       MTL::Size::Make(REDUCE_NUM_THREADS, 1, 1));
 
-  // Inputs are kept alive by the primitive graph; split-KV scratch buffers are
-  // registered as temporaries above so they survive both dispatches.
+  // Inputs are kept alive by the primitive graph; split-KV scratch is registered
+  // as a temporary above so it survives both dispatches.
 }
 
 // MLA paged attention as an MLX Primitive so the kernel dispatch participates
@@ -1709,7 +1715,7 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("block_size"), nb::arg("scale"),
         nb::arg("heads_per_tg") = 1,
         nb::arg("out"),
-        "Paged MLA (single-pass), wrapped as an MLX Primitive — fills "
+        "Paged MLA, wrapped as an MLX Primitive — fills "
         "``out`` with a lazy descriptor so the kernel call participates "
         "in the wrapper's lazy graph and avoids the per-call mx.eval "
         "boundary the eager binding requires. Saves ~200 μs at B=1 "

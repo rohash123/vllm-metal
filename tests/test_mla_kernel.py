@@ -439,6 +439,56 @@ def test_decode_many_blocks_per_warp(dtype: mx.Dtype) -> None:
     )
 
 
+def test_decode_split_kv_long_context_matches_reference() -> None:
+    """ctx_len = 32768 is large enough to exercise the MLA split-KV path while
+    keeping the dense reference small enough for a unit test."""
+    block_size = 32
+    ctx_len = 32768
+    num_heads = 2
+    dtype = mx.float16
+    (
+        q_nope,
+        q_pe,
+        latent_cache,
+        block_tables,
+        context_lens,
+        cu_seqlens_q,
+        block_tables_np,
+    ) = _make_inputs(
+        num_seqs=1,
+        num_heads=num_heads,
+        ctx_len=ctx_len,
+        block_size=block_size,
+        dtype=dtype,
+    )
+
+    out = metal_mla_paged_attention(
+        q_nope=q_nope,
+        q_pe=q_pe,
+        latent_cache=latent_cache,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        cu_seqlens_q=cu_seqlens_q,
+        scale=0.125,
+        heads_per_tg=2,
+    )
+
+    expected = _expected_output(
+        q_nope,
+        q_pe,
+        latent_cache,
+        block_tables_np,
+        ctx_lens=[ctx_len],
+        scale=0.125,
+    )
+    rtol, atol = _tolerance(dtype)
+    diff = mx.abs(out.astype(mx.float32) - expected.astype(mx.float32))
+    max_abs = mx.max(diff).item()
+    assert mx.allclose(
+        out.astype(mx.float32), expected.astype(mx.float32), rtol=rtol, atol=atol
+    ).item(), f"split-KV MLA mismatch: max_abs_diff={max_abs:.5f}"
+
+
 def test_decode_mixed_ctx_batch() -> None:
     """Batch with three sequences at different ctx_lens — exercises the
     per-seq context_lens read and ensures the kernel doesn't accidentally

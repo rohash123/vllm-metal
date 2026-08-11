@@ -6,8 +6,9 @@
 //
 // paged_mla_attention — fused score+softmax+V over a single threadgroup
 // per (head_group, q_token). With PARTITION_SIZE > 0, each threadgroup owns
-// one KV partition and writes scratch max/lse/output for the reduce kernel.
-// paged_mla_attention_reduce merges those partials across partitions.
+// one KV partition and writes a contiguous scratch row: normalized partial
+// output followed by that partition's LSE. paged_mla_attention_reduce merges
+// those partials across partitions.
 //
 // Decode kernel parallelism scheme mirrors MLX's sdpa_vector
 // (mlx/backend/metal/kernels/sdpa_vector.h, ml-explore/mlx@v0.31.2):
@@ -47,13 +48,12 @@ constant bool mla_use_partitioning [[function_constant(10)]];
 //
 // Buffer layout:
 //
-//   0: exp_sums    [num_seqs, num_heads, max_num_partitions]  fp32
-//                  (only when mla_use_partitioning)
-//   1: max_logits  [num_seqs, num_heads, max_num_partitions]  fp32
-//                  (only when mla_use_partitioning)
-//   2: out / tmp_out
+//   0: attn_logits [num_seqs, num_heads, max_num_partitions,
+//                   KV_LORA_RANK + 1] fp32
+//                  (only when mla_use_partitioning; +1 stores LSE in log2)
+//   2: out
 //        non-partitioned: [total_q_tokens, num_heads, KV_LORA_RANK] T
-//        partitioned    : [num_seqs, num_heads, max_num_partitions, KV_LORA_RANK] T
+//        partitioned    : unused by pass 1, written by reduce pass
 //   3: q_nope       [total_q_tokens, num_heads, KV_LORA_RANK] T  (post-embed_q)
 //   4: q_pe         [total_q_tokens, num_heads, QK_ROPE_HEAD_DIM] T  (post-RoPE)
 //   5: latent_cache [num_blocks, BLOCK_SIZE, KV_LORA_RANK + QK_ROPE_HEAD_DIM] T
@@ -87,10 +87,8 @@ template <typename T, int KV_LORA_RANK, int QK_ROPE_HEAD_DIM, int BLOCK_SIZE,
           int HEADS_PER_TG, int NUM_THREADS, int NUM_SIMD_LANES,
           int PARTITION_SIZE = 0>
 [[kernel, max_total_threads_per_threadgroup(NUM_THREADS)]] void paged_mla_attention(
-    device float *exp_sums
+    device float *attn_logits
     [[buffer(0), function_constant(mla_use_partitioning)]],
-    device float *max_logits
-    [[buffer(1), function_constant(mla_use_partitioning)]],
     device T *out [[buffer(2)]],
     device const T *q_nope [[buffer(3)]],
     device const T *q_pe [[buffer(4)]],
@@ -311,11 +309,13 @@ template <typename T, int KV_LORA_RANK, int QK_ROPE_HEAD_DIM, int BLOCK_SIZE,
     // array would push larger HEADS_PER_TG variants over the per-thread
     // register budget.
     const int head_idx = head_idx_base + h;
-    device T *out_base = USE_PARTITIONING
-        ? (out +
+    device T *out_base =
+        out + (q_token_idx * num_heads + head_idx) * KV_LORA_RANK;
+    device float *attn_logits_base = USE_PARTITIONING
+        ? (attn_logits +
            ((q_token_idx * num_heads + head_idx) * max_num_partitions +
-            partition_idx) * KV_LORA_RANK)
-        : (out + (q_token_idx * num_heads + head_idx) * KV_LORA_RANK);
+            partition_idx) * (KV_LORA_RANK + 1))
+        : nullptr;
 #pragma unroll
     for (int p = 0; p < NUM_PASSES; p++) {
 #pragma unroll
@@ -326,21 +326,21 @@ template <typename T, int KV_LORA_RANK, int QK_ROPE_HEAD_DIM, int BLOCK_SIZE,
             (lane < BN) ? outputs[(p * BN + sg) * BD + lane] : 0.0f;
         const float final_val = simd_sum(other * rescale) * inv_global;
         if (lane == 0) {
-          out_base[(p * BN + sg) * V_PER_THREAD + i] = T(final_val);
+          const int out_dim = (p * BN + sg) * V_PER_THREAD + i;
+          if (USE_PARTITIONING) {
+            attn_logits_base[out_dim] = final_val;
+          } else {
+            out_base[out_dim] = T(final_val);
+          }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
       }
     }
 
-    // ---- Phase D: per-head LSE / max metadata for the partitioned reduce ----
+    // ---- Phase D: per-head LSE metadata for the partitioned reduce ----
     if (USE_PARTITIONING) {
       if (lane == 0 && sg == 0) {
-        max_logits[(q_token_idx * num_heads + head_idx) * max_num_partitions +
-                   partition_idx] = global_max;
-        // exp_sums stores l (sum-of-exps at global_max) so reduce kernel can
-        // weight partitions correctly.
-        exp_sums[(q_token_idx * num_heads + head_idx) * max_num_partitions +
-                 partition_idx] = global_sum;
+        attn_logits_base[KV_LORA_RANK] = global_max + fast::log2(global_sum);
       }
     }
   }
@@ -350,14 +350,14 @@ template <typename T, int KV_LORA_RANK, int QK_ROPE_HEAD_DIM, int BLOCK_SIZE,
 // ========================================== Reduce kernel
 //
 // Cross-partition online-softmax merge. One threadgroup per (head, q_token).
-// The main kernel stores max logits in log2 space and exp_sums as exp2-normalized
-// sums, so the reduce side must also rescale with exp2.
+// The main kernel stores normalized partial outputs followed by per-partition
+// LSE in log2 space, so the reduce side weights partials with exp2(lse -
+// global_lse).
 //
 // Buffer layout:
 //   0: out          [total_q_tokens, num_heads, HEAD_SIZE] T
-//   1: exp_sums     [total_q_tokens, num_heads, max_num_partitions] fp32
-//   2: max_logits   [total_q_tokens, num_heads, max_num_partitions] fp32
-//   3: tmp_out      [total_q_tokens, num_heads, max_num_partitions, HEAD_SIZE] T
+//   1: attn_logits  [total_q_tokens, num_heads, max_num_partitions,
+//                    HEAD_SIZE + 1] fp32
 //   4: context_lens [num_seqs] uint32
 //   5: max_num_partitions (constant int)
 
@@ -365,9 +365,7 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
           int PARTITION_SIZE>
 [[kernel]] void paged_mla_attention_reduce(
     device T *out [[buffer(0)]],
-    const device float *exp_sums [[buffer(1)]],
-    const device float *max_logits [[buffer(2)]],
-    const device T *tmp_out [[buffer(3)]],
+    const device float *attn_logits [[buffer(1)]],
     const device uint32_t *context_lens [[buffer(4)]],
     const constant int &max_num_partitions [[buffer(5)]],
     threadgroup char *shared_mem [[threadgroup(0)]],
@@ -389,29 +387,26 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   const int num_partitions =
       (ctx_len + PARTITION_SIZE - 1) / PARTITION_SIZE;
 
-  threadgroup float *shared_max_logits = (threadgroup float *)shared_mem;
-  threadgroup float *shared_exp_sums = shared_max_logits + max_num_partitions;
-  threadgroup float *red_smem = shared_exp_sums + max_num_partitions;
+  threadgroup float *shared_weights = (threadgroup float *)shared_mem;
+  threadgroup float *red_smem = shared_weights + max_num_partitions;
 
   device T *out_ptr =
       out + (q_token_idx * num_heads + head_idx) * HEAD_SIZE;
-  const device T *tmp_out_ptr =
-      tmp_out +
-      (q_token_idx * num_heads + head_idx) * max_num_partitions * HEAD_SIZE;
+  const device float *attn_logits_ptr =
+      attn_logits +
+      (q_token_idx * num_heads + head_idx) * max_num_partitions *
+          (HEAD_SIZE + 1);
 
   if (num_partitions <= 1) {
     for (int d = thread_idx; d < HEAD_SIZE; d += NUM_THREADS) {
-      out_ptr[d] = tmp_out_ptr[d];
+      out_ptr[d] = T(attn_logits_ptr[d]);
     }
     return;
   }
 
-  const device float *max_logits_ptr =
-      max_logits + (q_token_idx * num_heads + head_idx) * max_num_partitions;
   float thread_max = -INFINITY;
   for (int i = thread_idx; i < num_partitions; i += NUM_THREADS) {
-    const float l = max_logits_ptr[i];
-    shared_max_logits[i] = l;
+    const float l = attn_logits_ptr[i * (HEAD_SIZE + 1) + HEAD_SIZE];
     thread_max = max(thread_max, l);
   }
 #pragma unroll
@@ -429,13 +424,11 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   }
   const float global_max = simd_shuffle(thread_max, 0);
 
-  const device float *exp_sums_ptr =
-      exp_sums + (q_token_idx * num_heads + head_idx) * max_num_partitions;
   float thread_exp_sum = 0.0f;
   for (int i = thread_idx; i < num_partitions; i += NUM_THREADS) {
-    const float l = shared_max_logits[i];
-    const float rescaled = exp_sums_ptr[i] * fast::exp2(l - global_max);
-    shared_exp_sums[i] = rescaled;
+    const float l = attn_logits_ptr[i * (HEAD_SIZE + 1) + HEAD_SIZE];
+    const float rescaled = fast::exp2(l - global_max);
+    shared_weights[i] = rescaled;
     thread_exp_sum += rescaled;
   }
 #pragma unroll
@@ -458,7 +451,7 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   for (int d = thread_idx; d < HEAD_SIZE; d += NUM_THREADS) {
     float acc = 0.0f;
     for (int j = 0; j < num_partitions; j++) {
-      acc += float(tmp_out_ptr[j * HEAD_SIZE + d]) * shared_exp_sums[j] *
+      acc += attn_logits_ptr[j * (HEAD_SIZE + 1) + d] * shared_weights[j] *
              inv_global;
     }
     out_ptr[d] = T(acc);
@@ -480,10 +473,8 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
                        #partition_size)]] [[kernel]] void                      \
   paged_mla_attention<type, kv_lora_rank, qk_rope_head_dim, block_size,        \
                       heads_per_tg, num_threads, 32, partition_size>(          \
-      device float * exp_sums                                                  \
+      device float * attn_logits                                               \
       [[buffer(0), function_constant(mla_use_partitioning)]],                  \
-      device float *max_logits                                                 \
-      [[buffer(1), function_constant(mla_use_partitioning)]],                  \
       device type *out [[buffer(2)]],                                          \
       device const type *q_nope [[buffer(3)]],                                 \
       device const type *q_pe [[buffer(4)]],                                   \
@@ -505,9 +496,7 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
                        "_nt256_nsl32_ps" #partition_size)]] [[kernel]] void    \
   paged_mla_attention_reduce<type, head_size, 256, 32, partition_size>(        \
       device type * out [[buffer(0)]],                                         \
-      const device float *exp_sums [[buffer(1)]],                              \
-      const device float *max_logits [[buffer(2)]],                            \
-      const device type *tmp_out [[buffer(3)]],                                \
+      const device float *attn_logits [[buffer(1)]],                           \
       const device uint32_t *context_lens [[buffer(4)]],                       \
       const constant int &max_num_partitions [[buffer(5)]],                    \
       threadgroup char *shared_mem [[threadgroup(0)]],                         \
@@ -522,20 +511,25 @@ instantiate_mla(half, 512, 64, 16, 1, 1024, 0);
 instantiate_mla(half, 512, 64, 32, 1, 1024, 0);
 instantiate_mla(bfloat16_t, 512, 64, 16, 1, 1024, 0);
 instantiate_mla(bfloat16_t, 512, 64, 32, 1, 1024, 0);
-instantiate_mla(half, 512, 64, 16, 1, 1024, 512);
-instantiate_mla(half, 512, 64, 32, 1, 1024, 512);
-instantiate_mla(bfloat16_t, 512, 64, 16, 1, 1024, 512);
-instantiate_mla(bfloat16_t, 512, 64, 32, 1, 1024, 512);
 
 // G=2 (2 heads per TG, NUM_THREADS=512). 2× KV-bandwidth amortization.
 instantiate_mla(half, 512, 64, 16, 2, 512, 0);
 instantiate_mla(half, 512, 64, 32, 2, 512, 0);
 instantiate_mla(bfloat16_t, 512, 64, 16, 2, 512, 0);
 instantiate_mla(bfloat16_t, 512, 64, 32, 2, 512, 0);
-instantiate_mla(half, 512, 64, 16, 2, 512, 512);
-instantiate_mla(half, 512, 64, 32, 2, 512, 512);
-instantiate_mla(bfloat16_t, 512, 64, 16, 2, 512, 512);
-instantiate_mla(bfloat16_t, 512, 64, 32, 2, 512, 512);
 
-instantiate_mla_reduce(half, 512, 512);
-instantiate_mla_reduce(bfloat16_t, 512, 512);
+#define instantiate_mla_partition_size(partition_size)                         \
+  instantiate_mla(half, 512, 64, 16, 1, 1024, partition_size);                 \
+  instantiate_mla(half, 512, 64, 32, 1, 1024, partition_size);                 \
+  instantiate_mla(bfloat16_t, 512, 64, 16, 1, 1024, partition_size);           \
+  instantiate_mla(bfloat16_t, 512, 64, 32, 1, 1024, partition_size);           \
+  instantiate_mla(half, 512, 64, 16, 2, 512, partition_size);                  \
+  instantiate_mla(half, 512, 64, 32, 2, 512, partition_size);                  \
+  instantiate_mla(bfloat16_t, 512, 64, 16, 2, 512, partition_size);            \
+  instantiate_mla(bfloat16_t, 512, 64, 32, 2, 512, partition_size);            \
+  instantiate_mla_reduce(half, 512, partition_size);                          \
+  instantiate_mla_reduce(bfloat16_t, 512, partition_size);
+
+instantiate_mla_partition_size(16384);
+instantiate_mla_partition_size(32768);
+instantiate_mla_partition_size(65536);
