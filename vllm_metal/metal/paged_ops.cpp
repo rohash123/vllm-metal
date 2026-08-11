@@ -1204,14 +1204,29 @@ static void dispatch_mla_paged_attention(
   });
 
   auto dt = dtype_to_metal(q_nope.dtype());
+  const bool pure_decode = total_q_tokens == num_seqs;
+  const int max_seq_len = max_num_blocks_per_seq * block_size;
+  const int max_num_partitions =
+      (max_seq_len + kPartitionSize - 1) / kPartitionSize;
+  const int gate_grid = (num_heads / heads_per_tg) * total_q_tokens;
+  // MLA split-KV writes a 512-wide tmp_out per partition before the reduce.
+  // Keep the first gate narrower than MHA's generic min_decode_grid() gate:
+  // local sweeps show the extra scratch/reduce traffic stops paying off once
+  // the unsplit MLA grid is already a few dozen threadgroups.
+  const int mla_split_grid_limit = std::min(min_decode_grid(), 32);
+  const bool partition =
+      pure_decode && gate_grid <= mla_split_grid_limit
+      && max_num_partitions >= 2;
+
   std::string kname = "paged_mla_attention_" + dt + "_kvr" +
                       std::to_string(kv_lora_rank) + "_pe" +
                       std::to_string(qk_rope_head_dim) + "_bs" +
                       std::to_string(block_size) + "_g" +
                       std::to_string(heads_per_tg) + "_nt" +
-                      std::to_string(num_threads) + "_nsl32_ps0";
+                      std::to_string(num_threads) + "_nsl32_ps" +
+                      std::to_string(partition ? kPartitionSize : 0);
 
-  bool use_partitioning = false;
+  bool use_partitioning = partition;
 
   std::string hash_name = kname + "_part" + (use_partitioning ? "1" : "0");
 
@@ -1236,10 +1251,55 @@ static void dispatch_mla_paged_attention(
       static_cast<size_t>((2 * heads_per_tg * BN + BD * BD) * sizeof(float));
 
   auto& enc = metal::get_command_encoder(s);
+
+  if (!partition) {
+    enc.set_compute_pipeline_state(kernel);
+    enc.set_threadgroup_memory_length(shmem, 0);
+
+    enc.set_output_array(out, 2);
+    enc.set_input_array(q_nope, 3);
+    enc.set_input_array(q_pe, 4);
+    enc.set_input_array(latent_cache, 5);
+    enc.set_input_array(block_tables, 6);
+    enc.set_input_array(context_lens, 7);
+    enc.set_input_array(cu_seqlens_q, 8);
+
+    int32_t num_seqs_i = static_cast<int32_t>(num_seqs);
+    int32_t max_blocks_i = static_cast<int32_t>(max_num_blocks_per_seq);
+    enc.set_bytes(num_seqs_i, 9);
+    enc.set_bytes(max_blocks_i, 10);
+    enc.set_bytes(scale, 11);
+
+    // Grid: (num_heads / G, total_q_tokens, 1). Each TG owns G consecutive
+    // query heads sharing the same latent KV.
+    enc.dispatch_threadgroups(
+        MTL::Size::Make(num_heads / heads_per_tg, total_q_tokens, 1),
+        MTL::Size::Make(num_threads, 1, 1));
+    return;
+  }
+
+  auto make_temp = [&](Shape shape, Dtype dtype) {
+    array a(std::move(shape), dtype, nullptr, {});
+    a.set_data(allocator::malloc(a.nbytes()));
+    enc.add_temporary(a);
+    return a;
+  };
+  array tmp_out = make_temp(
+      Shape{total_q_tokens, num_heads, max_num_partitions, kv_lora_rank},
+      q_nope.dtype());
+  array exp_sums =
+      make_temp(Shape{total_q_tokens, num_heads, max_num_partitions}, float32);
+  array max_logits =
+      make_temp(Shape{total_q_tokens, num_heads, max_num_partitions}, float32);
+
+  // Pass 1: split the context into kPartitionSize-token chunks. The main MLA
+  // kernel writes a normalized partial output plus softmax stats per partition.
   enc.set_compute_pipeline_state(kernel);
   enc.set_threadgroup_memory_length(shmem, 0);
 
-  enc.set_output_array(out, 2);
+  enc.set_output_array(exp_sums, 0);
+  enc.set_output_array(max_logits, 1);
+  enc.set_output_array(tmp_out, 2);
   enc.set_input_array(q_nope, 3);
   enc.set_input_array(q_pe, 4);
   enc.set_input_array(latent_cache, 5);
@@ -1253,19 +1313,42 @@ static void dispatch_mla_paged_attention(
   enc.set_bytes(max_blocks_i, 10);
   enc.set_bytes(scale, 11);
 
-  // Grid: (num_heads / G, total_q_tokens, 1). Each TG owns G consecutive
-  // query heads sharing the same latent KV.
+  // Grid: (num_heads / G, total_q_tokens, max_num_partitions). Each TG owns G
+  // consecutive query heads sharing one partition of the latent KV.
   enc.dispatch_threadgroups(
-      MTL::Size::Make(num_heads / heads_per_tg, total_q_tokens, 1),
+      MTL::Size::Make(num_heads / heads_per_tg, total_q_tokens,
+                      max_num_partitions),
       MTL::Size::Make(num_threads, 1, 1));
 
-  // No add_temporary calls: the only caller is MlaPagedAttentionPrimitive,
-  // and inside a primitive MLX manages array lifetimes via the completion
-  // handler.
+  // Pass 2: merge per-partition partials with the online-softmax reduce.
+  constexpr int REDUCE_NUM_THREADS = 256;
+  constexpr int REDUCE_NUM_WARPS = REDUCE_NUM_THREADS / 32;
+  std::string reduce_kname = "paged_mla_attention_reduce_" + dt + "_hs" +
+                             std::to_string(kv_lora_rank) + "_nt256_nsl32_ps" +
+                             std::to_string(kPartitionSize);
+  auto* reduce_kernel = d.get_kernel(reduce_kname, lib, reduce_kname, {});
+
+  size_t reduce_shmem = static_cast<size_t>(
+      (2 * max_num_partitions + 2 * REDUCE_NUM_WARPS) * sizeof(float));
+  enc.set_compute_pipeline_state(reduce_kernel);
+  enc.set_threadgroup_memory_length((reduce_shmem + 15) & ~size_t(15), 0);
+  enc.set_output_array(out, 0);
+  enc.set_input_array(exp_sums, 1);
+  enc.set_input_array(max_logits, 2);
+  enc.set_input_array(tmp_out, 3);
+  enc.set_input_array(context_lens, 4);
+  int32_t max_num_partitions_i = static_cast<int32_t>(max_num_partitions);
+  enc.set_bytes(max_num_partitions_i, 5);
+  enc.dispatch_threadgroups(
+      MTL::Size::Make(num_heads, total_q_tokens, 1),
+      MTL::Size::Make(REDUCE_NUM_THREADS, 1, 1));
+
+  // Inputs are kept alive by the primitive graph; split-KV scratch buffers are
+  // registered as temporaries above so they survive both dispatches.
 }
 
-// MLA single-pass paged attention as an MLX Primitive so the kernel
-// dispatch participates in the lazy graph (no per-call mx.eval boundary).
+// MLA paged attention as an MLX Primitive so the kernel dispatch participates
+// in the lazy graph (no per-call mx.eval boundary).
 class MlaPagedAttentionPrimitive : public UnaryPrimitive {
  public:
   MlaPagedAttentionPrimitive(
