@@ -1224,15 +1224,16 @@ static void dispatch_mla_paged_attention(
   const bool occupancy_limited = gate_grid < kMlaMaxSinglePassGrid;
   // MLA split-KV manufactures more in-flight memory work by splitting the
   // long-context scan across grid.z. Keep the partition count small: each
-  // partition writes a vLLM-style scratch row with kv_lora_rank partial output
-  // values plus one LSE, and the reduce reads it back.
+  // partition writes a model-dtype partial output plus one fp32 LSE, and the
+  // reduce reads both back.
   constexpr int kMlaMaxNumPartitions = 4;
-  constexpr int64_t kMlaSplitScratchValueLimit = 512 * 1024;
-  const int64_t split_scratch_values =
+  constexpr int64_t kMlaSplitScratchByteLimit = 512 * 1024 * sizeof(float);
+  const int64_t split_scratch_bytes =
       static_cast<int64_t>(total_q_tokens) * num_heads *
-      max_num_partitions * (kv_lora_rank + 1);
+      max_num_partitions *
+      (kv_lora_rank * static_cast<int>(q_nope.itemsize()) + sizeof(float));
   const bool scratch_budget_ok =
-      split_scratch_values <= kMlaSplitScratchValueLimit;
+      split_scratch_bytes <= kMlaSplitScratchByteLimit;
   const bool partition =
       pure_decode && occupancy_limited && mla_partition_size > 0
       && max_num_partitions >= 2
@@ -1304,17 +1305,19 @@ static void dispatch_mla_paged_attention(
     enc.add_temporary(a);
     return a;
   };
-  array attn_logits = make_temp(
-      Shape{total_q_tokens, num_heads, max_num_partitions, kv_lora_rank + 1},
-      float32);
+  array tmp_out = make_temp(
+      Shape{total_q_tokens, num_heads, max_num_partitions, kv_lora_rank},
+      q_nope.dtype());
+  array lse =
+      make_temp(Shape{total_q_tokens, num_heads, max_num_partitions}, float32);
 
   // Pass 1: split the context into mla_partition_size-token chunks. The main MLA
   // kernel writes normalized partial output plus LSE per partition.
   enc.set_compute_pipeline_state(kernel);
   enc.set_threadgroup_memory_length(shmem, 0);
 
-  enc.set_output_array(attn_logits, 0);
-  enc.set_output_array(out, 2);
+  enc.set_output_array(lse, 0);
+  enc.set_output_array(tmp_out, 2);
   enc.set_input_array(q_nope, 3);
   enc.set_input_array(q_pe, 4);
   enc.set_input_array(latent_cache, 5);
@@ -1348,7 +1351,8 @@ static void dispatch_mla_paged_attention(
   enc.set_compute_pipeline_state(reduce_kernel);
   enc.set_threadgroup_memory_length((reduce_shmem + 15) & ~size_t(15), 0);
   enc.set_output_array(out, 0);
-  enc.set_input_array(attn_logits, 1);
+  enc.set_input_array(lse, 1);
+  enc.set_input_array(tmp_out, 3);
   enc.set_input_array(context_lens, 4);
   int32_t max_num_partitions_i = static_cast<int32_t>(max_num_partitions);
   enc.set_bytes(max_num_partitions_i, 5);
