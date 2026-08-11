@@ -1224,14 +1224,16 @@ static void dispatch_mla_paged_attention(
   const bool occupancy_limited = gate_grid < kMlaMaxSinglePassGrid;
   // MLA split-KV manufactures more in-flight memory work by splitting the
   // long-context scan across grid.z. Keep the partition count small: each
-  // partition writes a model-dtype partial output plus one fp32 LSE, and the
-  // reduce reads both back.
+  // partition writes a model-dtype partial output plus one fp32 LSE. Partition
+  // 0 reuses the final output buffer as scratch, so tmp_out only stores
+  // partitions 1..N-1.
   constexpr int kMlaMaxNumPartitions = 4;
   constexpr int64_t kMlaSplitScratchByteLimit = 512 * 1024 * sizeof(float);
   const int64_t split_scratch_bytes =
       static_cast<int64_t>(total_q_tokens) * num_heads *
-      max_num_partitions *
-      (kv_lora_rank * static_cast<int>(q_nope.itemsize()) + sizeof(float));
+      ((max_num_partitions - 1) * kv_lora_rank *
+           static_cast<int>(q_nope.itemsize()) +
+       max_num_partitions * sizeof(float));
   const bool scratch_budget_ok =
       split_scratch_bytes <= kMlaSplitScratchByteLimit;
   const bool partition =
@@ -1306,7 +1308,7 @@ static void dispatch_mla_paged_attention(
     return a;
   };
   array tmp_out = make_temp(
-      Shape{total_q_tokens, num_heads, max_num_partitions, kv_lora_rank},
+      Shape{total_q_tokens, num_heads, max_num_partitions - 1, kv_lora_rank},
       q_nope.dtype());
   array lse =
       make_temp(Shape{total_q_tokens, num_heads, max_num_partitions}, float32);
@@ -1330,6 +1332,7 @@ static void dispatch_mla_paged_attention(
   enc.set_bytes(num_seqs_i, 9);
   enc.set_bytes(max_blocks_i, 10);
   enc.set_bytes(scale, 11);
+  enc.set_output_array(out, 12);
 
   // Grid: (num_heads / G, total_q_tokens, max_num_partitions). Each TG owns G
   // consecutive query heads sharing one partition of the latent KV.

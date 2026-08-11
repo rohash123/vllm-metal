@@ -51,7 +51,7 @@ constant bool mla_use_partitioning [[function_constant(10)]];
 //                (only when mla_use_partitioning; log2-space LSE)
 //   2: out / tmp_out
 //        non-partitioned: [total_q_tokens, num_heads, KV_LORA_RANK] T
-//        partitioned    : [total_q_tokens, num_heads, max_num_partitions,
+//        partitioned    : [total_q_tokens, num_heads, max_num_partitions - 1,
 //                          KV_LORA_RANK] T
 //   3: q_nope       [total_q_tokens, num_heads, KV_LORA_RANK] T  (post-embed_q)
 //   4: q_pe         [total_q_tokens, num_heads, QK_ROPE_HEAD_DIM] T  (post-RoPE)
@@ -62,6 +62,8 @@ constant bool mla_use_partitioning [[function_constant(10)]];
 //   9: num_seqs (constant int)
 //  10: max_num_blocks_per_seq (constant int)
 //  11: scale (constant float)
+//  12: partition0_out [total_q_tokens, num_heads, KV_LORA_RANK] T
+//                      (only when mla_use_partitioning)
 //
 // Grid:
 //   non-partitioned: (num_heads / HEADS_PER_TG, total_q_tokens, 1)
@@ -98,6 +100,8 @@ template <typename T, int KV_LORA_RANK, int QK_ROPE_HEAD_DIM, int BLOCK_SIZE,
     const constant int &num_seqs [[buffer(9)]],
     const constant int &max_num_blocks_per_seq [[buffer(10)]],
     const constant float &scale [[buffer(11)]],
+    device T *partition0_out
+    [[buffer(12), function_constant(mla_use_partitioning)]],
     threadgroup char *shared_mem [[threadgroup(0)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
     uint3 threadgroups_per_grid [[threadgroups_per_grid]],
@@ -308,11 +312,18 @@ template <typename T, int KV_LORA_RANK, int QK_ROPE_HEAD_DIM, int BLOCK_SIZE,
     // array would push larger HEADS_PER_TG variants over the per-thread
     // register budget.
     const int head_idx = head_idx_base + h;
-    device T *out_base = USE_PARTITIONING
-        ? (out +
-           ((q_token_idx * num_heads + head_idx) * max_num_partitions +
-            partition_idx) * KV_LORA_RANK)
-        : (out + (q_token_idx * num_heads + head_idx) * KV_LORA_RANK);
+    device T *out_base =
+        out + (q_token_idx * num_heads + head_idx) * KV_LORA_RANK;
+    if (USE_PARTITIONING) {
+      out_base = (partition_idx == 0)
+          ? (partition0_out +
+             (q_token_idx * num_heads + head_idx) * KV_LORA_RANK)
+          : (out +
+             ((q_token_idx * num_heads + head_idx) *
+                  (max_num_partitions - 1) +
+              (partition_idx - 1)) *
+                 KV_LORA_RANK);
+    }
     device float *lse_base = USE_PARTITIONING
         ? (lse + (q_token_idx * num_heads + head_idx) * max_num_partitions +
            partition_idx)
@@ -353,7 +364,8 @@ template <typename T, int KV_LORA_RANK, int QK_ROPE_HEAD_DIM, int BLOCK_SIZE,
 // Buffer layout:
 //   0: out          [total_q_tokens, num_heads, HEAD_SIZE] T
 //   1: lse          [total_q_tokens, num_heads, max_num_partitions] fp32
-//   3: tmp_out      [total_q_tokens, num_heads, max_num_partitions, HEAD_SIZE] T
+//   3: tmp_out      [total_q_tokens, num_heads, max_num_partitions - 1,
+//                    HEAD_SIZE] T
 //   4: context_lens [num_seqs] uint32
 //   5: max_num_partitions (constant int)
 
@@ -393,7 +405,8 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
       lse + (q_token_idx * num_heads + head_idx) * max_num_partitions;
   const device T *tmp_out_ptr =
       tmp_out +
-      (q_token_idx * num_heads + head_idx) * max_num_partitions * HEAD_SIZE;
+      (q_token_idx * num_heads + head_idx) * (max_num_partitions - 1) *
+          HEAD_SIZE;
 
   if (num_partitions <= 1) {
     for (int d = thread_idx; d < HEAD_SIZE; d += NUM_THREADS) {
@@ -449,8 +462,10 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   for (int d = thread_idx; d < HEAD_SIZE; d += NUM_THREADS) {
     float acc = 0.0f;
     for (int j = 0; j < num_partitions; j++) {
-      acc += float(tmp_out_ptr[j * HEAD_SIZE + d]) * shared_weights[j] *
-             inv_global;
+      const float partial =
+          (j == 0) ? float(out_ptr[d])
+                   : float(tmp_out_ptr[(j - 1) * HEAD_SIZE + d]);
+      acc += partial * shared_weights[j] * inv_global;
     }
     out_ptr[d] = T(acc);
   }
@@ -483,6 +498,8 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
       const constant int &num_seqs [[buffer(9)]],                              \
       const constant int &max_num_blocks_per_seq [[buffer(10)]],               \
       const constant float &scale [[buffer(11)]],                              \
+      device type *partition0_out                                              \
+      [[buffer(12), function_constant(mla_use_partitioning)]],                 \
       threadgroup char *shared_mem [[threadgroup(0)]],                         \
       uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],     \
       uint3 threadgroups_per_grid [[threadgroups_per_grid]],                   \
